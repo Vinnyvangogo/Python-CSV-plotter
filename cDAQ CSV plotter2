@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+CDAQ CSV Channel Plot Viewer
+=============================
+
+A dark-themed desktop GUI (Tkinter + Matplotlib) for loading a cDAQ-style
+CSV log (one "Timestamp" column followed by any number of channel columns).
+
+- Every channel has a checkbox (grouped by module for convenience) that
+  toggles its trace on/off. All enabled channels are drawn together on a
+  single shared plot.
+- Hovering over the plot shows a live crosshair readout of every visible
+  channel's value at that time.
+- Left-click on the plot to drop a PINNED cursor at that location. Pinned
+  cursors stay put (they do not follow the mouse), so you can move the
+  mouse away, add more pinned cursors, or reach for a button, without
+  losing them. Right-click removes the nearest pinned cursor. "Clear
+  Cursors" removes them all.
+- "Save Image..." exports the plot exactly as currently displayed
+  (including any pinned cursors) to a PNG/PDF/SVG file.
+
+Usage:
+    python cdaq_plot_viewer.py [optional/path/to/file.csv]
+
+Requirements:
+    pip install pandas matplotlib numpy
+"""
+
+import os
+import sys
+import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.transforms import blended_transform_factory
+from matplotlib.backends.backend_tkagg import (
+    FigureCanvasTkAgg, NavigationToolbar2Tk
+)
+from matplotlib.figure import Figure
+
+# --- Dark theme palette ---
+BG = "#1e1e1e"          # main window / panel background
+BG_LIGHT = "#2b2b2b"    # slightly lighter panels (checkbox list, entries)
+FG = "#e0e0e0"          # primary text
+FG_DIM = "#9a9a9a"      # secondary/status text
+ACCENT = "#3a7ca5"      # selection/active accent
+BORDER = "#444444"
+
+plt.style.use("dark_background")
+COLOR_CYCLE = plt.rcParams['axes.prop_cycle'].by_key()['color']
+PIN_COLORS = ["#ffe066", "#66fff2", "#ff66c4", "#ffffff", "#9dff66"]
+
+
+def guess_group(col_name: str) -> str:
+    """Bucket a channel name into a module/group, for sidebar organization only.
+
+    Handles two naming conventions seen in cDAQ exports:
+      - 'ModN_CHxx_...'  -> group 'ModN' (the trailing number is a distinct module ID,
+                            and channels are distinguished by the following CHxx token)
+      - 'TCnn_...'       -> group 'TC'   (the trailing number is just the channel's own
+                            index, so all thermocouples share a single group)
+    """
+    parts = col_name.split("_")
+    first = parts[0]
+    m = re.match(r"^([A-Za-z]+)(\d*)$", first)
+    if not m:
+        return first
+    letters, digits = m.groups()
+    if digits and len(parts) > 1 and re.match(r"^CH\d+$", parts[1], re.IGNORECASE):
+        return first  # e.g. "Mod2" is the module id; "CH00" distinguishes the channel
+    return letters or first  # e.g. "TC00" -> "TC"; the "00" is just the channel index
+
+
+class CdaqPlotViewer(tk.Tk):
+    def __init__(self, initial_file=None):
+        super().__init__()
+        self.title("CDAQ CSV Channel Plot Viewer")
+        self.geometry("1500x900")
+        self.configure(bg=BG)
+        self._apply_dark_style()
+
+        self.df = None
+        self.x_col = None
+        self.xnum = None                 # numeric/date2num version of x for nearest-point lookups
+        self.groups = []                 # ordered list of module/group names (sidebar only)
+        self.channel_cols = []
+        self.channel_vars = {}           # col -> tk.BooleanVar
+        self.lines = {}                  # col -> Line2D (on the single shared axes)
+        self.pinned = []                 # list of pinned-cursor dicts
+
+        self._build_layout()
+
+        if initial_file and os.path.isfile(initial_file):
+            self.load_csv(initial_file)
+
+    # --------------------------------------------------------------- theme
+    def _apply_dark_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")  # the built-in theme most reliably re-themeable
+
+        style.configure(".", background=BG, foreground=FG,
+                         fieldbackground=BG_LIGHT, bordercolor=BORDER,
+                         darkcolor=BG, lightcolor=BG, troughcolor=BG,
+                         font=("TkDefaultFont", 9))
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=FG)
+        style.configure("TButton", background=BG_LIGHT, foreground=FG,
+                         bordercolor=BORDER, focuscolor=ACCENT, padding=4)
+        style.map("TButton",
+                   background=[("active", ACCENT), ("pressed", ACCENT)],
+                   foreground=[("active", "#ffffff")])
+        style.configure("TEntry", fieldbackground=BG_LIGHT, foreground=FG,
+                         insertcolor=FG, bordercolor=BORDER)
+        style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor=BG)
+        style.map("TCheckbutton",
+                   background=[("active", BG)],
+                   foreground=[("active", "#ffffff")],
+                   indicatorcolor=[("selected", ACCENT), ("!selected", BG_LIGHT)])
+        style.configure("Vertical.TScrollbar", background=BG_LIGHT, troughcolor=BG,
+                         bordercolor=BG, arrowcolor=FG)
+        style.configure("TPanedwindow", background=BG)
+        style.configure("TSeparator", background=BORDER)
+
+    # ------------------------------------------------------------------ UI
+    def _build_layout(self):
+        top = ttk.Frame(self, padding=6)
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(top, text="Open CSV...", command=self.open_file_dialog).pack(side=tk.LEFT)
+        ttk.Button(top, text="Select All", command=self.select_all).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(top, text="Clear Cursors", command=self.clear_cursors).pack(side=tk.LEFT)
+        ttk.Button(top, text="Save Image...", command=self.save_image).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(top, text="Filter:").pack(side=tk.LEFT, padx=(20, 4))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self.apply_filter())
+        ttk.Entry(top, textvariable=self.filter_var, width=30).pack(side=tk.LEFT)
+
+        self.status_var = tk.StringVar(value="No file loaded.")
+        ttk.Label(top, textvariable=self.status_var, foreground=FG_DIM).pack(side=tk.RIGHT)
+
+        main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # --- Left panel: scrollable checkbox list ---
+        left_container = ttk.Frame(main, width=340)
+        main.add(left_container, weight=0)
+
+        cb_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0, bg=BG)
+        cb_vscroll = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=cb_canvas.yview)
+        self.checkbox_frame = ttk.Frame(cb_canvas)
+
+        self.checkbox_frame.bind(
+            "<Configure>", lambda e: cb_canvas.configure(scrollregion=cb_canvas.bbox("all"))
+        )
+        cb_canvas.create_window((0, 0), window=self.checkbox_frame, anchor="nw")
+        cb_canvas.configure(yscrollcommand=cb_vscroll.set)
+        cb_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cb_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_cb_mousewheel(event):
+            cb_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        cb_canvas.bind("<MouseWheel>", _on_cb_mousewheel)
+        self.checkbox_frame.bind("<MouseWheel>", _on_cb_mousewheel)
+
+        # --- Right panel: toolbar + single shared plot ---
+        right = ttk.Frame(main)
+        main.add(right, weight=1)
+
+        self.fig = Figure(figsize=(10, 6), dpi=100)
+        self.fig.patch.set_facecolor(BG)
+        self.ax = self.fig.add_subplot(111)
+        self._style_axes()
+
+        toolbar_holder = tk.Frame(right, bg=BG_LIGHT)
+        toolbar_holder.pack(side=tk.TOP, fill=tk.X)
+
+        canvas_holder = ttk.Frame(right)
+        canvas_holder.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_holder)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_holder)
+        self.toolbar.config(background=BG_LIGHT)
+        for child in self.toolbar.winfo_children():
+            child.config(background=BG_LIGHT)
+        self.toolbar.update()
+
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("figure_leave_event", lambda e: self._hide_hover())
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+
+        # --- hover (live, transient) crosshair artifacts ---
+        self.hover_vline = self.ax.axvline(color="#888888", linestyle="--", linewidth=0.8, visible=False, zorder=4)
+        self.ax.relim(visible_only=True)  # don't let the phantom x=0 poison autoscale
+        self.hover_markers = {}  # col -> Line2D, created lazily to match self.lines
+        self.hover_text = self.ax.text(
+            0.01, 0.98, "", transform=self.ax.transAxes, va="top", ha="left",
+            fontsize=8, family="monospace", visible=False, color=FG,
+            bbox=dict(boxstyle="round", fc=BG, ec=BORDER, alpha=0.9)
+        )
+
+    def _style_axes(self):
+        ax = self.ax
+        ax.set_facecolor(BG_LIGHT)
+        ax.grid(True, alpha=0.25, color=FG_DIM)
+        ax.tick_params(labelsize=8, colors=FG_DIM)
+        for spine in ax.spines.values():
+            spine.set_color(BORDER)
+        ax.set_ylabel("Value", color=FG)
+
+    # --------------------------------------------------------------- data
+    def open_file_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select CDAQ CSV file",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if path:
+            self.load_csv(path)
+
+    def load_csv(self, path):
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            messagebox.showerror("Error loading CSV", str(e))
+            return
+
+        if df.shape[1] < 2:
+            messagebox.showerror("Error", "CSV needs at least one timestamp column and one data column.")
+            return
+
+        self.x_col = df.columns[0]
+        try:
+            df[self.x_col] = pd.to_datetime(df[self.x_col])
+        except Exception:
+            pass
+
+        self.df = df
+        self.channel_cols = [c for c in df.columns if c != self.x_col]
+
+        if pd.api.types.is_datetime64_any_dtype(self.df[self.x_col]):
+            self.xnum = mdates.date2num(self.df[self.x_col])
+        else:
+            xnum = pd.to_numeric(self.df[self.x_col], errors="coerce").values
+            self.xnum = xnum if not np.isnan(xnum).all() else np.arange(len(self.df), dtype=float)
+
+        self.status_var.set(
+            f"{os.path.basename(path)}  |  {len(df):,} rows  |  {len(self.channel_cols)} channels"
+        )
+
+        self._reset_plot()
+        self._build_checkboxes()
+
+    def _reset_plot(self):
+        self.ax.cla()
+        self._style_axes()
+        self.ax.set_xlabel(str(self.x_col), fontsize=9, color=FG)
+        self.lines = {}
+        self.pinned = []
+        self.hover_vline = self.ax.axvline(color="#888888", linestyle="--", linewidth=0.8, visible=False, zorder=4)
+        self.ax.relim(visible_only=True)
+        self.hover_markers = {}
+        self.hover_text = self.ax.text(
+            0.01, 0.98, "", transform=self.ax.transAxes, va="top", ha="left",
+            fontsize=8, family="monospace", visible=False, color=FG,
+            bbox=dict(boxstyle="round", fc=BG, ec=BORDER, alpha=0.9)
+        )
+        self.canvas.draw_idle()
+
+    # ---------------------------------------------------------- checkboxes
+    def _build_checkboxes(self):
+        for w in self.checkbox_frame.winfo_children():
+            w.destroy()
+        self.channel_vars.clear()
+
+        groups = {}
+        for col in self.channel_cols:
+            groups.setdefault(guess_group(col), []).append(col)
+        self.groups = sorted(groups.keys())
+
+        row = 0
+        for group in self.groups:
+            cols = groups[group]
+            header = ttk.Frame(self.checkbox_frame)
+            header.grid(row=row, column=0, sticky="w", pady=(10 if row else 0, 2), padx=4)
+            row += 1
+
+            ttk.Label(header, text=group, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
+            ttk.Button(header, text="all", width=4,
+                       command=lambda cols=cols: self._set_group(cols, True)).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Button(header, text="none", width=5,
+                       command=lambda cols=cols: self._set_group(cols, False)).pack(side=tk.LEFT)
+
+            for col in cols:
+                var = tk.BooleanVar(value=False)
+                self.channel_vars[col] = var
+                cb = ttk.Checkbutton(
+                    self.checkbox_frame, text=col, variable=var,
+                    command=lambda c=col: self._toggle_channel(c)
+                )
+                cb.grid(row=row, column=0, sticky="w", padx=18)
+                row += 1
+
+    def _set_group(self, cols, value):
+        for c in cols:
+            self.channel_vars[c].set(value)
+            self._toggle_channel(c)
+
+    def select_all(self):
+        for c, var in self.channel_vars.items():
+            var.set(True)
+            self._toggle_channel(c)
+
+    def clear_all(self):
+        for c, var in self.channel_vars.items():
+            var.set(False)
+            self._toggle_channel(c)
+
+    def apply_filter(self):
+        text = self.filter_var.get().lower().strip()
+        for widget in self.checkbox_frame.winfo_children():
+            if isinstance(widget, ttk.Checkbutton):
+                label = widget.cget("text").lower()
+                if (text in label) if text else True:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    # ------------------------------------------------------------- plotting
+    def _toggle_channel(self, col):
+        is_on = self.channel_vars[col].get()
+
+        if is_on:
+            if col not in self.lines:
+                color = COLOR_CYCLE[len(self.lines) % len(COLOR_CYCLE)]
+                line, = self.ax.plot(self.df[self.x_col], self.df[col], label=col, linewidth=1, color=color)
+                self.lines[col] = line
+                marker, = self.ax.plot([], [], "o", color=color, markersize=5, visible=False, zorder=5)
+                self.hover_markers[col] = marker
+            else:
+                self.lines[col].set_visible(True)
+        else:
+            if col in self.lines:
+                self.lines[col].set_visible(False)
+                if col in self.hover_markers:
+                    self.hover_markers[col].set_visible(False)
+            # also drop this channel's marker from any pinned cursors
+            for pin in self.pinned:
+                m = pin["markers"].pop(col, None)
+                if m is not None:
+                    m.remove()
+                self._refresh_pin_text(pin)
+
+        self._refresh_legend()
+
+    def _refresh_legend(self):
+        visible = [l for l in self.lines.values() if l.get_visible()]
+        if visible:
+            self.ax.legend(visible, [l.get_label() for l in visible],
+                            loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                            fontsize=8, borderaxespad=0., facecolor=BG,
+                            edgecolor=BORDER, labelcolor=FG)
+            self.ax.relim(visible_only=True)
+            self.ax.autoscale_view()
+            self.fig.subplots_adjust(right=0.8)
+        else:
+            leg = self.ax.get_legend()
+            if leg:
+                leg.remove()
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------- shared helpers
+    def _format_x(self, val):
+        if isinstance(val, pd.Timestamp):
+            return val.strftime("%H:%M:%S.%f")[:-3]
+        try:
+            return f"{val:.6g}"
+        except (TypeError, ValueError):
+            return str(val)
+
+    def _nearest_index(self, xdata):
+        idx = int(np.searchsorted(self.xnum, xdata))
+        idx = min(max(idx, 0), len(self.xnum) - 1)
+        if idx > 0 and abs(self.xnum[idx - 1] - xdata) < abs(self.xnum[idx] - xdata):
+            idx -= 1
+        return idx
+
+    def _visible_cols(self):
+        return [c for c, l in self.lines.items() if l.get_visible()]
+
+    def _readout_lines(self, idx):
+        parts = [self._format_x(self.df[self.x_col].iloc[idx])]
+        for col in self._visible_cols():
+            y = self.df[col].iloc[idx]
+            short = col if len(col) <= 28 else col[:25] + "..."
+            parts.append(f"{short}: {y:.4f}")
+        return parts
+
+    # --------------------------------------------------------- hover cursor
+    def _hide_hover(self):
+        changed = False
+        if self.hover_vline.get_visible():
+            self.hover_vline.set_visible(False)
+            changed = True
+        if self.hover_text.get_visible():
+            self.hover_text.set_visible(False)
+            changed = True
+        for m in self.hover_markers.values():
+            if m.get_visible():
+                m.set_visible(False)
+                changed = True
+        if changed:
+            self.canvas.draw_idle()
+
+    def _on_motion(self, event):
+        if self.df is None or event.inaxes != self.ax:
+            self._hide_hover()
+            return
+        xdata = event.xdata
+        if xdata is None or self.xnum is None or len(self.xnum) == 0:
+            return
+
+        visible_cols = self._visible_cols()
+        if not visible_cols:
+            return
+
+        idx = self._nearest_index(xdata)
+        xval = self.xnum[idx]
+
+        for col in visible_cols:
+            y = self.df[col].iloc[idx]
+            self.hover_markers[col].set_data([xval], [y])
+            self.hover_markers[col].set_visible(True)
+
+        self.hover_vline.set_xdata([xval, xval])
+        self.hover_vline.set_visible(True)
+        self.hover_text.set_text("\n".join(self._readout_lines(idx)))
+        self.hover_text.set_visible(True)
+        self.canvas.draw_idle()
+
+    # -------------------------------------------------------- pinned cursors
+    def _on_click(self, event):
+        if self.df is None or event.inaxes != self.ax:
+            return
+        if self.toolbar.mode != "":   # a zoom/pan tool is active in the toolbar; don't pin
+            return
+        if event.xdata is None:
+            return
+
+        if event.button == 3:        # right-click: remove nearest pinned cursor
+            self._remove_nearest_pin(event.xdata)
+            self.canvas.draw_idle()
+            return
+
+        if event.button != 1:
+            return
+
+        visible_cols = self._visible_cols()
+        if not visible_cols:
+            return
+
+        idx = self._nearest_index(event.xdata)
+        xval = self.xnum[idx]
+        color = PIN_COLORS[len(self.pinned) % len(PIN_COLORS)]
+
+        vline = self.ax.axvline(xval, color=color, linestyle="-", linewidth=1.1, zorder=6)
+        markers = {}
+        for col in visible_cols:
+            y = self.df[col].iloc[idx]
+            m, = self.ax.plot([xval], [y], "o", color=color, markersize=6,
+                               markeredgecolor="black", markeredgewidth=0.5, zorder=7)
+            markers[col] = m
+
+        y_frac = 0.98 - 0.14 * len(self.pinned)
+        trans = blended_transform_factory(self.ax.transData, self.ax.transAxes)
+        text = self.ax.text(
+            xval, max(y_frac, 0.03), "", transform=trans, va="top", ha="left",
+            fontsize=8, family="monospace", color="black",
+            bbox=dict(boxstyle="round", fc=color, ec="black", alpha=0.92), zorder=8
+        )
+
+        pin = {"idx": idx, "xval": xval, "vline": vline, "markers": markers, "text": text, "color": color}
+        self._refresh_pin_text(pin)
+        self.pinned.append(pin)
+        self.canvas.draw_idle()
+
+    def _refresh_pin_text(self, pin):
+        idx = pin["idx"]
+        parts = [self._format_x(self.df[self.x_col].iloc[idx])]
+        for col, marker in pin["markers"].items():
+            y = self.df[col].iloc[idx]
+            short = col if len(col) <= 28 else col[:25] + "..."
+            parts.append(f"{short}: {y:.4f}")
+        pin["text"].set_text("\n".join(parts))
+
+    def _remove_nearest_pin(self, xdata):
+        if not self.pinned:
+            return
+        nearest = min(self.pinned, key=lambda p: abs(p["xval"] - xdata))
+        self._remove_pin(nearest)
+
+    def _remove_pin(self, pin):
+        pin["vline"].remove()
+        for m in pin["markers"].values():
+            m.remove()
+        pin["text"].remove()
+        self.pinned.remove(pin)
+
+    def clear_cursors(self):
+        for pin in list(self.pinned):
+            self._remove_pin(pin)
+        self._hide_hover()
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------- export
+    def save_image(self):
+        if self.df is None:
+            messagebox.showinfo("Nothing to save", "Load a CSV and enable some channels first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save plot as image",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            self.fig.savefig(path, dpi=150, facecolor=self.fig.get_facecolor())
+            messagebox.showinfo("Saved", f"Plot saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error saving image", str(e))
+
+
+def main():
+    initial_file = sys.argv[1] if len(sys.argv) > 1 else None
+    app = CdaqPlotViewer(initial_file=initial_file)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
